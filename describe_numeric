@@ -1,20 +1,50 @@
 def describe_numeric_fast(df, exclude=None, accuracy=10000):
     """
-    Estadísticos por columna numérica en una sola pasada (rápido).
-    Devuelve: [variable, mean, stddev, min, max, p1, p50, p99]
-    - exclude: lista de columnas a excluir
-    - accuracy: buffer de percentile_approx (↑ = más preciso, más memoria)
+    Compute summary statistics for all numeric columns in a single Spark job.
+    Returns a Spark DataFrame with columns:
+        [variable, mean, stddev, min, max, p1, median, p99]
+
+    Parameters
+    ----------
+    df : pyspark.sql.DataFrame
+        Input Spark DataFrame.
+
+    exclude : list of str, optional
+        List of columns to exclude from the numeric summary.
+        Default is None.
+
+    accuracy : int, optional
+        Accuracy parameter for percentile_approx().
+        Higher values yield more precise percentiles but require more memory.
+        Default = 10_000 (good balance between accuracy and performance).
+
+    Returns
+    -------
+    pyspark.sql.DataFrame
+        A long-format DataFrame where each row corresponds to one numeric column,
+        containing its main descriptive statistics.
+
+    Notes
+    -----
+    • This implementation runs in a single aggregation job — no loops or collects.
+    • Percentiles (p1, median, p99) are computed with percentile_approx()
+      for efficiency; they are approximate but very close on large datasets.
+    • Suitable for quick profiling, data quality checks, or model monitoring dashboards.
     """
     from pyspark.sql import functions as F
     from pyspark.sql.types import NumericType
 
+    # Identify numeric columns
     exclude = set(exclude or [])
     numeric_cols = [f.name for f in df.schema.fields
                     if isinstance(f.dataType, NumericType) and f.name not in exclude]
-    if not numeric_cols:
-        return df.sparkSession.createDataFrame([], "variable string, mean double, stddev double, min double, max double, p1 double, p50 double, p99 double")
 
-    # 1) Agregamos TODO en un único agg (un job)
+    # Return empty DataFrame if no numeric columns
+    if not numeric_cols:
+        return df.sparkSession.createDataFrame([], 
+            "variable string, mean double, stddev double, min double, max double, p1 double, median double, p99 double")
+
+    # --- 1) Compute all statistics in one aggregation job ---
     exprs = []
     for c in numeric_cols:
         exprs.extend([
@@ -28,7 +58,7 @@ def describe_numeric_fast(df, exclude=None, accuracy=10000):
         ])
     agg1 = df.agg(*exprs)
 
-    # 2) Proyectamos el único registro en arrays alineados y explotamos (sin más scans)
+    # --- 2) Transform wide → long format efficiently ---
     lit_vars = F.array(*[F.lit(c) for c in numeric_cols])
     arr_mean = F.array(*[F.col(f"{c}__mean")  for c in numeric_cols])
     arr_std  = F.array(*[F.col(f"{c}__stddev") for c in numeric_cols])
@@ -38,26 +68,31 @@ def describe_numeric_fast(df, exclude=None, accuracy=10000):
     arr_p50  = F.array(*[F.col(f"{c}__p50")   for c in numeric_cols])
     arr_p99  = F.array(*[F.col(f"{c}__p99")   for c in numeric_cols])
 
-    zipped = F.arrays_zip(lit_vars.alias("variable"),
-                          arr_mean.alias("mean"),
-                          arr_std.alias("stddev"),
-                          arr_min.alias("min"),
-                          arr_max.alias("max"),
-                          arr_p1.alias("p1"),
-                          arr_p50.alias("p50"),
-                          arr_p99.alias("p99"))
+    zipped = F.arrays_zip(
+        lit_vars.alias("variable"),
+        arr_mean.alias("mean"),
+        arr_std.alias("stddev"),
+        arr_min.alias("min"),
+        arr_max.alias("max"),
+        arr_p1.alias("p1"),
+        arr_p50.alias("median"),
+        arr_p99.alias("p99")
+    )
 
-    long_df = (agg1
-               .select(F.explode(zipped).alias("z"))
-               .select(
-                   F.col("z.variable").alias("variable"),
-                   F.col("z.mean").alias("mean"),
-                   F.col("z.stddev").alias("stddev"),
-                   F.col("z.min").alias("min"),
-                   F.col("z.max").alias("max"),
-                   F.col("z.p1").alias("p1"),
-                   F.col("z.p50").alias("median"),
-                   F.col("z.p99").alias("p99"),
-               ))
+    long_df = (
+        agg1
+        .select(F.explode(zipped).alias("z"))
+        .select(
+            F.col("z.variable").alias("variable"),
+            F.col("z.mean").alias("mean"),
+            F.col("z.stddev").alias("stddev"),
+            F.col("z.min").alias("min"),
+            F.col("z.max").alias("max"),
+            F.col("z.p1").alias("p1"),
+            F.col("z.median").alias("median"),
+            F.col("z.p99").alias("p99"),
+        )
+    )
 
+    # Sort by median (optional, for readability)
     return long_df.orderBy(F.desc_nulls_last("median"))
