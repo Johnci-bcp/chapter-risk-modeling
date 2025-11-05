@@ -313,3 +313,25 @@ out = gini_by_numeric_features_fast(
     df, "default_flag", bins=64, unpivot_strategy="loop"
 )
 
+
+Py4JError: An error occurred while calling None.org.apache.spark.ml.feature.Bucketizer. Trace:
+py4j.security.Py4JSecurityException: Constructor public org.apache.spark.ml.feature.Bucketizer(java.lang.String) is not whitelisted.
+	at py4j.security.WhitelistingPy4JSecurityManager.checkConstructor(WhitelistingPy4JSecurityManager.java:451)
+	at py4j.Gateway.invoke(Gateway.java:256)
+	at py4j.commands.ConstructorCommand.invokeConstructor(ConstructorCommand.java:80)
+	at py4j.commands.ConstructorCommand.execute(ConstructorCommand.java:69)
+	at py4j.ClientServerConnection.waitForCommands(ClientServerConnection.java:199)
+	at py4j.ClientServerConnection.run(ClientServerConnection.java:119)
+	at java.lang.Thread.run(Thread.java:750)
+
+File <command-6418755958010626>, line 1
+----> 1 out = gini_by_numeric_features_fast(
+      2     df, bad_flag, unpivot_strategy="loop")
+File <command-6418755958010502>, line 115, in gini_by_numeric_features_fast(df, label, positive, exclude, bins, rel_err, unpivot_strategy)
+    113 if splits[0] != float("-inf") or splits[-1] != float("inf"):
+    114     splits = [float("-inf")] + splits[1:-1] + [float("inf")] if len(splits) > 2 else [float("-inf"), float("inf")]
+--> 115 bucketizer = Bucketizer(splits=splits, inputCol=c, outputCol=outc, handleInvalid="skip")
+    116 binned = bucketizer.transform(binned)
+    117 bin_col_names.append(outc)
+
+
