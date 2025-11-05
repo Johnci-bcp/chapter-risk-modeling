@@ -96,3 +96,220 @@ def describe_numeric_fast(df, exclude=None, accuracy=10000):
 
     # Sort by median (optional, for readability)
     return long_df.orderBy(F.desc_nulls_last("median"))
+
+
+
+
+
+from typing import List, Optional, Tuple
+from pyspark.sql import functions as F, Window
+from pyspark.ml.feature import Bucketizer
+from pyspark.sql.types import NumericType, Row
+
+def gini_by_numeric_features_fast(
+    df,
+    label: str,
+    positive=1,
+    exclude: Optional[List[str]] = None,
+    bins: int = 128,
+    rel_err: float = 1e-3,
+    unpivot_strategy: str = "stack"
+):
+    """
+    Compute per-feature AUC and Gini (2*AUC-1) for many numeric columns at scale.
+
+    Approach
+    --------
+    1) Select numeric columns (minus `exclude` and `label`).
+    2) Compute quantile-based bin edges for ALL numeric columns in ONE call
+       using approxQuantile(..., relErr=rel_err).
+    3) Bucketize each numeric column using those edges (no UDFs).
+    4) Aggregate counts per (feature, bin) and compute AUC via Mann–Whitney:
+         - sum_ranks_pos = Σ_bin [ avg_rank_bin * pos_in_bin ]
+         - avg_rank_bin = (cum_before + 1 + cum_before + cnt_bin) / 2
+         - AUC = (sum_ranks_pos - n_pos*(n_pos+1)/2) / (n_pos*n_neg)
+       Then fix orientation (if auc<0.5 -> 1-auc).
+
+    Parameters
+    ----------
+    df : pyspark.sql.DataFrame
+        Input DataFrame.
+    label : str
+        Name of the binary target column.
+    positive : Any
+        Value considered as the positive class (default=1).
+    exclude : list[str], optional
+        Columns to skip (IDs, leakage vars, etc.).
+    bins : int
+        Number of quantile bins per feature (>= 8 is recommended).
+        More bins -> higher fidelity, more intermediate data.
+    rel_err : float
+        Relative error for approxQuantile. Smaller -> more precise edges, costlier.
+    unpivot_strategy : {"stack", "loop"}
+        - "stack": single wide->long unpivot, one big aggregation job (fast if K not huge).
+        - "loop" : per-feature light groupBy job; safer when K is very large.
+
+    Returns
+    -------
+    pyspark.sql.DataFrame
+        Columns: [variable, auc, gini, direction, n, n_pos, n_neg, bins_used]
+
+    Notes
+    -----
+    • Uses quantile bucketization to avoid sorting each feature.
+    • No Python UDFs; everything is Catalyst-friendly.
+    • If a feature is constant (insufficient distinct edges), it’s skipped.
+    • For extremely wide tables, consider: unpivot_strategy="loop" and/or smaller `bins`.
+    """
+
+    # --- 0) Prep & guards ---
+    exclude = set(exclude or [])
+    # Identify numeric cols (excluding label and excluded list)
+    numeric_cols = [
+        f.name for f in df.schema.fields
+        if isinstance(f.dataType, NumericType) and f.name not in exclude and f.name != label
+    ]
+    if not numeric_cols:
+        return df.sparkSession.createDataFrame([], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int")
+
+    # Binarize label once (handle arbitrary values)
+    y = (F.col(label) == F.lit(positive)).cast("int").alias("_y_")
+    base = df.select(*numeric_cols, y).where(F.col("_y_").isNotNull())
+    # total, positives, negatives (same for all features)
+    n_row = base.agg(F.count("*").alias("n"), F.sum("_y_").alias("n_pos")).first()
+    n = int(n_row["n"] or 0)
+    n_pos = int(n_row["n_pos"] or 0)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0 or n == 0:
+        # Undefined AUC/Gini if one class is missing or dataset empty
+        return df.sparkSession.createDataFrame([], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int")
+
+    # --- 1) Quantile edges in ONE call ---
+    # target quantiles for bin edges: 0..1 with bins+1 points
+    qs = [i / float(bins) for i in range(bins + 1)]
+    edges_all = base.approxQuantile(numeric_cols, qs, rel_err)  # one job
+
+    # Build valid edge lists per column (deduplicate if repeated edges)
+    col_splits = {}
+    for c, edges in zip(numeric_cols, edges_all):
+        uniq = sorted(set(edges))
+        # Need at least two distinct values to build bin(s)
+        if len(uniq) < 2:
+            continue
+        # Ensure Bucketizer convention: strictly increasing
+        # (if there are duplicates, set will have removed them)
+        col_splits[c] = uniq
+
+    usable_cols = list(col_splits.keys())
+    if not usable_cols:
+        return df.sparkSession.createDataFrame([], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int")
+
+    # --- 2) Bucketize all usable columns (no action yet) ---
+    binned = base
+    bin_col_names = []
+    for c in usable_cols:
+        outc = f"{c}__bin"
+        # Bucketizer expects -inf..+inf convention; extend edges to be safe
+        splits = col_splits[c]
+        # If first/last aren't wide enough, extend a bit
+        # (Spark allows exact edges; adding ±inf is safer for outliers)
+        if splits[0] != float("-inf") or splits[-1] != float("inf"):
+            splits = [float("-inf")] + splits[1:-1] + [float("inf")] if len(splits) > 2 else [float("-inf"), float("inf")]
+        bucketizer = Bucketizer(splits=splits, inputCol=c, outputCol=outc, handleInvalid="skip")
+        binned = bucketizer.transform(binned)
+        bin_col_names.append(outc)
+
+    # Helper to compute AUC/Gini from (feature, bin) aggregates
+    def _auc_from_binned(agg_df):
+        w = Window.partitionBy("variable").orderBy("bin")
+        # counts per bin already computed: cnt, pos
+        # cum_before = cumulative sum of cnt minus current cnt
+        cum_cnt = F.sum("cnt").over(w)
+        cum_before = cum_cnt - F.col("cnt")
+        avg_rank = (cum_before + F.lit(1.0) + cum_before + F.col("cnt")) / 2.0
+        sum_ranks_pos = F.sum(avg_rank * F.col("pos")).over(Window.partitionBy("variable"))
+        auc_asc = (sum_ranks_pos - F.lit(n_pos * (n_pos + 1) / 2.0)) / F.lit(n_pos * n_neg)
+        # Reduce to one row per variable
+        one = (agg_df
+               .withColumn("auc_asc", auc_asc)
+               .groupBy("variable")
+               .agg(F.max("auc_asc").alias("auc_asc"),
+                    F.max("bins_used").alias("bins_used")))
+        # Orientation fix
+        one = one.withColumn("auc", F.when(F.col("auc_asc") >= 0.5, F.col("auc_asc"))
+                                   .otherwise(1.0 - F.col("auc_asc")))
+        one = one.withColumn("gini", 2.0 * F.col("auc") - 1.0)
+        one = one.withColumn("direction", F.when(F.col("auc_asc") >= 0.5, F.lit("ascending")).otherwise(F.lit("descending")))
+        # Add n, n_pos, n_neg
+        one = (one
+               .withColumn("n", F.lit(n))
+               .withColumn("n_pos", F.lit(n_pos))
+               .withColumn("n_neg", F.lit(n_neg)))
+        return one.select("variable", "auc", "gini", "direction", "n", "n_pos", "n_neg", "bins_used")
+
+    # --- 3A) Single-pass unpivot (fast when K is moderate) ---
+    if unpivot_strategy == "stack":
+        # Build stack(expr) → (variable, bin) two columns
+        # stack(k, 'c1', c1__bin, 'c2', c2__bin, ...) as (variable, bin)
+        n_pairs = len(usable_cols)
+        parts = []
+        for c in usable_cols:
+            parts.append(f"'{c}'")
+            parts.append(f"`{c}__bin`")
+        stack_expr = f"stack({n_pairs}, " + ", ".join(parts) + ") as (variable, bin)"
+        long_df = binned.selectExpr("_y_", stack_expr).where(F.col("bin").isNotNull())
+
+        agg = (long_df
+               .groupBy("variable", "bin")
+               .agg(F.count("*").alias("cnt"),
+                    F.sum("_y_").alias("pos")))
+        # Attach bins_used per variable (for info)
+        bins_used = agg.groupBy("variable").agg(F.count("*").alias("bins_used"))
+        agg = agg.join(bins_used, "variable", "left")
+
+        return _auc_from_binned(agg)
+
+    # --- 3B) Column-by-column light jobs (safer when K is huge) ---
+    elif unpivot_strategy == "loop":
+        results = []
+        for c in usable_cols:
+            bc = f"{c}__bin"
+            agg = (binned
+                   .select("_y_", F.col(bc).alias("bin"))
+                   .where(F.col("bin").isNotNull())
+                   .groupBy("bin")
+                   .agg(F.count("*").alias("cnt"),
+                        F.sum("_y_").alias("pos"))
+                   .withColumn("variable", F.lit(c)))
+            agg = agg.withColumn("bins_used", F.count("*").over(Window.partitionBy("variable")))
+            results.append(_auc_from_binned(agg))
+
+        from functools import reduce
+        if not results:
+            return df.sparkSession.createDataFrame([], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int")
+
+        return reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), results).orderBy(F.desc("gini"))
+
+    else:
+        raise ValueError("unpivot_strategy must be 'stack' or 'loop'")
+
+
+
+
+# Caso típico (rápido, todo en una pasada con unpivot):
+out = gini_by_numeric_features_fast(
+    df,
+    label="default_flag",
+    positive=1,
+    exclude=["id", "customer_id"],
+    bins=128,          # sube a 256 si quieres más fidelidad; baja a 64 si hay MUCHAS columnas
+    rel_err=1e-3,      # edges más precisos con 1e-4 (más costo)
+    unpivot_strategy="stack"
+)
+out.show(truncate=False)
+
+# Si tienes cientos (o miles) de columnas:
+out = gini_by_numeric_features_fast(
+    df, "default_flag", bins=64, unpivot_strategy="loop"
+)
+
