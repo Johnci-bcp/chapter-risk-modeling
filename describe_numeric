@@ -1,0 +1,29 @@
+def describe_numeric(df):
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import NumericType
+    from pyspark.sql import Row
+
+    numeric_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, NumericType)]
+    
+    stats_expr = []
+    for c in numeric_cols:
+        stats_expr.extend([
+            F.mean(c).alias(f"{c}_mean"),
+            F.stddev(c).alias(f"{c}_stddev"),
+            F.min(c).alias(f"{c}_min"),
+            F.max(c).alias(f"{c}_max")
+        ])
+    df_basic = df.agg(*stats_expr)
+    
+    rows = []
+    for c in numeric_cols:
+        q = df.approxQuantile(c, [0.01, 0.5, 0.99], 0.0)
+        rows.append(Row(
+            variable=c,
+            mean=df_basic.select(f"{c}_mean").first()[0],
+            stddev=df_basic.select(f"{c}_stddev").first()[0],
+            min=df_basic.select(f"{c}_min").first()[0],
+            max=df_basic.select(f"{c}_max").first()[0],
+            p1=q[0], median=q[1], p99=q[2]
+        ))
+    return df.sparkSession.createDataFrame(rows)
