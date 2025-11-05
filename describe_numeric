@@ -1,51 +1,63 @@
-def describe_numeric(df, exclude=None, quantiles=(0.01, 0.5, 0.99), rel_err=0.0):
+def describe_numeric_fast(df, exclude=None, accuracy=10000):
     """
-    Devuelve un DataFrame Spark con [variable, mean, stddev, min, max, p<q>...]
+    Estadísticos por columna numérica en una sola pasada (rápido).
+    Devuelve: [variable, mean, stddev, min, max, p1, p50, p99]
     - exclude: lista de columnas a excluir
-    - quantiles: tupla/lista de cuantiles (e.g., (0.01, 0.5, 0.99))
-    - rel_err: error relativo para approxQuantile (0.0 = exacto)
+    - accuracy: buffer de percentile_approx (↑ = más preciso, más memoria)
     """
-    from pyspark.sql import functions as F, Row
+    from pyspark.sql import functions as F
     from pyspark.sql.types import NumericType
 
     exclude = set(exclude or [])
     numeric_cols = [f.name for f in df.schema.fields
                     if isinstance(f.dataType, NumericType) and f.name not in exclude]
-
     if not numeric_cols:
-        return df.sparkSession.createDataFrame([], schema="variable string")
+        return df.sparkSession.createDataFrame([], "variable string, mean double, stddev double, min double, max double, p1 double, p50 double, p99 double")
 
-    # 1) Estadísticos básicos en una sola agregación (un job)
+    # 1) Agregamos TODO en un único agg (un job)
     exprs = []
     for c in numeric_cols:
         exprs.extend([
-            F.mean(c).alias(f"{c}_mean"),
-            F.stddev(c).alias(f"{c}_stddev"),
-            F.min(c).alias(f"{c}_min"),
-            F.max(c).alias(f"{c}_max"),
+            F.mean(c).alias(f"{c}__mean"),
+            F.stddev_samp(c).alias(f"{c}__stddev"),
+            F.min(c).alias(f"{c}__min"),
+            F.max(c).alias(f"{c}__max"),
+            F.expr(f"percentile_approx(`{c}`, 0.01, {accuracy})").alias(f"{c}__p1"),
+            F.expr(f"percentile_approx(`{c}`, 0.50, {accuracy})").alias(f"{c}__p50"),
+            F.expr(f"percentile_approx(`{c}`, 0.99, {accuracy})").alias(f"{c}__p99"),
         ])
-    basic_row = df.agg(*exprs).collect()[0]  # una sola pasada y un solo collect
+    agg1 = df.agg(*exprs)
 
-    # 2) Quantiles para todas las columnas en un solo llamado (otro job)
-    q_list = list(quantiles)
-    q_values_all = df.approxQuantile(numeric_cols, q_list, rel_err)
+    # 2) Proyectamos el único registro en arrays alineados y explotamos (sin más scans)
+    lit_vars = F.array(*[F.lit(c) for c in numeric_cols])
+    arr_mean = F.array(*[F.col(f"{c}__mean")  for c in numeric_cols])
+    arr_std  = F.array(*[F.col(f"{c}__stddev") for c in numeric_cols])
+    arr_min  = F.array(*[F.col(f"{c}__min")   for c in numeric_cols])
+    arr_max  = F.array(*[F.col(f"{c}__max")   for c in numeric_cols])
+    arr_p1   = F.array(*[F.col(f"{c}__p1")    for c in numeric_cols])
+    arr_p50  = F.array(*[F.col(f"{c}__p50")   for c in numeric_cols])
+    arr_p99  = F.array(*[F.col(f"{c}__p99")   for c in numeric_cols])
 
-    # 3) Construcción del resultado fila a fila (sin más jobs)
-    rows = []
-    for i, c in enumerate(numeric_cols):
-        q_vals = q_values_all[i]  # [q1, q2, q3, ...] para la columna c
-        row_dict = {
-            "variable": c,
-            "mean": basic_row[f"{c}_mean"],
-            "stddev": basic_row[f"{c}_stddev"],
-            "min": basic_row[f"{c}_min"],
-            "max": basic_row[f"{c}_max"],
-        }
-        # agrega p<q> dinámicamente (p1, p50, p99, etc.)
-        for q, v in zip(q_list, q_vals):
-            # nombres legibles: 0.01 -> p1, 0.5 -> p50, 0.99 -> p99
-            pct = int(round(q * 100))
-            row_dict[f"p{pct}"] = v
-        rows.append(Row(**row_dict))
+    zipped = F.arrays_zip(lit_vars.alias("variable"),
+                          arr_mean.alias("mean"),
+                          arr_std.alias("stddev"),
+                          arr_min.alias("min"),
+                          arr_max.alias("max"),
+                          arr_p1.alias("p1"),
+                          arr_p50.alias("p50"),
+                          arr_p99.alias("p99"))
 
-    return df.sparkSession.createDataFrame(rows)
+    long_df = (agg1
+               .select(F.explode(zipped).alias("z"))
+               .select(
+                   F.col("z.variable").alias("variable"),
+                   F.col("z.mean").alias("mean"),
+                   F.col("z.stddev").alias("stddev"),
+                   F.col("z.min").alias("min"),
+                   F.col("z.max").alias("max"),
+                   F.col("z.p1").alias("p1"),
+                   F.col("z.p50").alias("median"),
+                   F.col("z.p99").alias("p99"),
+               ))
+
+    return long_df.orderBy(F.desc_nulls_last("median"))
