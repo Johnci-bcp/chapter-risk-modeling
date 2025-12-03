@@ -183,8 +183,6 @@ def describe_numeric_in_chunks(df, exclude=None, rel_error=0.001, chunk_size=50)
 [JVM_ATTRIBUTE_NOT_SUPPORTED] Directly accessing the underlying Spark driver JVM using the attribute '_jdf' is not supported on shared clusters. If you require direct access to these fields, consider using a single-user cluster. For more details on compatibility and limitations, check: https://learn.microsoft.com/azure/databricks/compute/access-mode-limitations.html#shared-access-mode-limitations-on-unity-catalog
 
 
-
-
 from typing import List, Optional
 from pyspark.sql import functions as F, Window
 from pyspark.sql.types import NumericType
@@ -196,12 +194,15 @@ def gini_by_numeric_features_fast(
     exclude: Optional[List[str]] = None,
     bins: int = 128,
     rel_err: float = 1e-3,
-    unpivot_strategy: str = "stack"
+    unpivot_strategy: str = "stack",
+    fillna_zero: bool = False,
+    sample_frac: Optional[float] = None,
+    sample_seed: int = 42,
 ):
     """
     Compute per-feature AUC and Gini (2*AUC-1) for many numeric columns at scale,
-    using quantile-based pre-binning (approxQuantile) + Mann–Whitney formulation,
-    without MLlib Bucketizer (avoids Py4J whitelisting issues). No UDFs.
+    using quantile-based pre-binning (approxQuantile) + Mann–Whitney formulation.
+    No UDFs. Supports optional missing-value handling and row sampling.
 
     Parameters
     ----------
@@ -214,12 +215,19 @@ def gini_by_numeric_features_fast(
     exclude : list[str], optional
         Columns to skip (IDs, leakage vars, etc.).
     bins : int
-        Number of quantile bins per feature (typ. 64–256).
+        Number of quantile bins per feature (typ. 32–128; lower is faster).
     rel_err : float
         Relative error for approxQuantile (smaller -> more precise, higher cost).
     unpivot_strategy : {"stack", "loop"}
-        "stack": single wide→long unpivot + one big aggregation (fast if K not huge).
+        "stack": single wide→long unpivot + one big aggregation
         "loop" : per-feature light job (safer when you have a very wide table).
+    fillna_zero : bool
+        If True, feature nulls are imputed to 0.0 before binning.
+        If False, rows with null feature values are excluded.
+    sample_frac : float or None
+        Optional fraction of rows to sample for speed (e.g., 0.2). If None, use full data.
+    sample_seed : int
+        Random seed for sampling.
 
     Returns
     -------
@@ -228,11 +236,16 @@ def gini_by_numeric_features_fast(
     """
 
     # ---------------- Helpers ----------------
-    def _build_bin_expr(col, splits):
+    def _build_bin_expr(col, splits, fillna_zero=False):
         """
         Build native CASE WHEN expression returning bin index for `col` given sorted `splits`.
         Bins cover [splits[i], splits[i+1]) except the last, which includes the right bound.
+
+        If fillna_zero=True, nulls are first coalesced to 0.0.
         """
+        if fillna_zero:
+            col = F.coalesce(col, F.lit(0.0))
+
         # Ensure -inf / +inf guard rails
         if splits[0] != float("-inf"):
             splits = [float("-inf")] + splits
@@ -246,7 +259,7 @@ def gini_by_numeric_features_fast(
             right = F.lit(splits[i + 1])
             cond = (col >= left) & (col < right) if i < last_idx else (col >= left) & (col <= right)
             expr = F.when(cond, F.lit(i)).otherwise(expr) if expr is not None else F.when(cond, F.lit(i))
-        return expr  # null if no match (e.g., null col)
+        return expr  # null if no match
 
     def _auc_from_binned(agg_df, n, n_pos, n_neg):
         """
@@ -266,11 +279,14 @@ def gini_by_numeric_features_fast(
                .agg(F.max("auc_asc").alias("auc_asc"),
                     F.max("bins_used").alias("bins_used")))
 
-        one = one.withColumn("auc", F.when(F.col("auc_asc") >= 0.5, F.col("auc_asc")).otherwise(1.0 - F.col("auc_asc")))
+        one = one.withColumn("auc", F.when(F.col("auc_asc") >= 0.5, F.col("auc_asc"))
+                                       .otherwise(1.0 - F.col("auc_asc")))
         one = one.withColumn("gini", 2.0 * F.col("auc") - 1.0)
-        one = one.withColumn("direction",
-                             F.when(F.col("auc_asc") >= 0.5, F.lit("ascending"))
-                              .otherwise(F.lit("descending")))
+        one = one.withColumn(
+            "direction",
+            F.when(F.col("auc_asc") >= 0.5, F.lit("ascending"))
+             .otherwise(F.lit("descending"))
+        )
         one = (one
                .withColumn("n", F.lit(n))
                .withColumn("n_pos", F.lit(n_pos))
@@ -279,23 +295,33 @@ def gini_by_numeric_features_fast(
 
     # ---------------- 0) Prep & guards ----------------
     exclude = set(exclude or [])
-    numeric_cols = [f.name for f in df.schema.fields
-                    if isinstance(f.dataType, NumericType) and f.name not in exclude and f.name != label]
+    numeric_cols = [
+        f.name for f in df.schema.fields
+        if isinstance(f.dataType, NumericType) and f.name not in exclude and f.name != label
+    ]
+
     if not numeric_cols:
         return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
+            [], "variable string, auc double, gini double, direction string, "
+                "n long, n_pos long, n_neg long, bins_used int"
         )
 
     y = (F.col(label) == F.lit(positive)).cast("int").alias("_y_")
     base = df.select(*numeric_cols, y)
 
+    # Optional sampling to speed up everything
+    if sample_frac is not None and 0.0 < sample_frac < 1.0:
+        base = base.sample(withReplacement=False, fraction=sample_frac, seed=sample_seed)
+
+    # n, n_pos, n_neg on the (possibly) sampled base
     n_row = base.agg(F.count("*").alias("n"), F.sum("_y_").alias("n_pos")).first()
     n = int(n_row["n"] or 0)
     n_pos = int(n_row["n_pos"] or 0)
     n_neg = n - n_pos
     if n == 0 or n_pos == 0 or n_neg == 0:
         return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
+            [], "variable string, auc double, gini double, direction string, "
+                "n long, n_pos long, n_neg long, bins_used int"
         )
 
     # ---------------- 1) Quantile splits (one call) ----------------
@@ -311,13 +337,17 @@ def gini_by_numeric_features_fast(
     usable_cols = list(col_splits.keys())
     if not usable_cols:
         return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
+            [], "variable string, auc double, gini double, direction string, "
+                "n long, n_pos long, n_neg long, bins_used int"
         )
 
-    # ---------------- 2) Bin assignment with CASE WHEN (no Bucketizer) ----------------
+    # ---------------- 2) Bin assignment ----------------
     binned = base
     for c in usable_cols:
-        binned = binned.withColumn(f"{c}__bin", _build_bin_expr(F.col(c), col_splits[c]))
+        binned = binned.withColumn(
+            f"{c}__bin",
+            _build_bin_expr(F.col(c), col_splits[c], fillna_zero=fillna_zero)
+        )
 
     # ---------------- 3A) Unpivot strategy: stack ----------------
     if unpivot_strategy == "stack":
@@ -354,10 +384,102 @@ def gini_by_numeric_features_fast(
             out = res if out is None else out.unionByName(res, allowMissingColumns=True)
 
         return out.orderBy(F.desc("gini")) if out is not None else df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
+            [], "variable string, auc double, gini double, direction string, "
+                "n long, n_pos long, n_neg long, bins_used int"
         )
 
     else:
         raise ValueError("unpivot_strategy must be 'stack' or 'loop'")
+
+
+def gini_by_numeric_features_with_missing(
+    df,
+    label: str,
+    positive=1,
+    exclude: Optional[List[str]] = None,
+    bins: int = 128,
+    rel_err: float = 1e-3,
+    unpivot_strategy: str = "stack",
+    sample_frac: Optional[float] = None,
+    sample_seed: int = 42,
+):
+    """
+    Compute two Ginis per numeric feature:
+      - gini_no_missing   : dropping rows where feature is null
+      - gini_missing_zero : imputing null feature values with 0.0
+
+    Returns
+    -------
+    pyspark.sql.DataFrame
+        Columns:
+          variable,
+          auc_no_missing, gini_no_missing,
+          auc_missing_zero, gini_missing_zero,
+          direction_no_missing, direction_missing_zero,
+          n, n_pos, n_neg, bins_used_no_missing, bins_used_missing_zero
+    """
+
+    # 1) Gini excluyendo missing
+    res_no = gini_by_numeric_features_fast(
+        df=df,
+        label=label,
+        positive=positive,
+        exclude=exclude,
+        bins=bins,
+        rel_err=rel_err,
+        unpivot_strategy=unpivot_strategy,
+        fillna_zero=False,
+        sample_frac=sample_frac,
+        sample_seed=sample_seed
+    ).withColumnRenamed("auc", "auc_no_missing") \
+     .withColumnRenamed("gini", "gini_no_missing") \
+     .withColumnRenamed("direction", "direction_no_missing") \
+     .withColumnRenamed("bins_used", "bins_used_no_missing")
+
+    # 2) Gini imputando missing como 0
+    res_zero = gini_by_numeric_features_fast(
+        df=df,
+        label=label,
+        positive=positive,
+        exclude=exclude,
+        bins=bins,
+        rel_err=rel_err,
+        unpivot_strategy=unpivot_strategy,
+        fillna_zero=True,
+        sample_frac=sample_frac,
+        sample_seed=sample_seed
+    ).select(
+        "variable", "auc", "gini", "direction", "bins_used"
+    ).withColumnRenamed("auc", "auc_missing_zero") \
+     .withColumnRenamed("gini", "gini_missing_zero") \
+     .withColumnRenamed("direction", "direction_missing_zero") \
+     .withColumnRenamed("bins_used", "bins_used_missing_zero")
+
+    # 3) Join por variable
+    out = (
+        res_no.join(res_zero, on="variable", how="left")
+              .select(
+                  "variable",
+                  "auc_no_missing", "gini_no_missing", "direction_no_missing",
+                  "auc_missing_zero", "gini_missing_zero", "direction_missing_zero",
+                  "n", "n_pos", "n_neg",
+                  "bins_used_no_missing", "bins_used_missing_zero"
+              )
+    )
+
+    return out
+
+from pyspark.sql import functions as F
+
+gini_uni = gini_by_numeric_features_with_missing(
+    df=credit_df,
+    label="default_flag",
+    bins=64,
+    rel_err=1e-3,
+    unpivot_strategy="loop",    # si tienes muchas columnas
+    sample_frac=0.3             # si la base es muy grande
+)
+
+gini_uni.orderBy(F.desc("gini_no_missing")).show(20, truncate=False)
 
 
