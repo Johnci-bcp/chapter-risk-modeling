@@ -399,23 +399,20 @@ def gini_by_numeric_features_with_missing(
       - gini_no_missing   : dropping rows where feature is null
       - gini_missing_zero : imputing null feature values with 0.0
 
-    Returns
-    -------
-    pyspark.sql.DataFrame
-        Columns:
-          variable,
-          auc_no_missing, gini_no_missing,
-          auc_missing_zero, gini_missing_zero,
-          direction_no_missing, direction_missing_zero,
-          n, n_pos, n_neg, bins_used_no_missing, bins_used_missing_zero
+    Fully supports `exclude`, which is applied in both calculations.
     """
 
+    # normalizamos exclude
+    exclude = set(exclude or [])
+
+    # ============================================================
     # 1) Gini excluyendo missing
+    # ============================================================
     res_no = gini_by_numeric_features_fast(
         df=df,
         label=label,
         positive=positive,
-        exclude=exclude,
+        exclude=exclude,            # <-- NOW PASSED CORRECTLY
         bins=bins,
         rel_err=rel_err,
         unpivot_strategy=unpivot_strategy,
@@ -427,12 +424,14 @@ def gini_by_numeric_features_with_missing(
      .withColumnRenamed("direction", "direction_no_missing") \
      .withColumnRenamed("bins_used", "bins_used_no_missing")
 
+    # ============================================================
     # 2) Gini imputando missing como 0
+    # ============================================================
     res_zero = gini_by_numeric_features_fast(
         df=df,
         label=label,
         positive=positive,
-        exclude=exclude,
+        exclude=exclude,           # <-- NOW PASSED CORRECTLY
         bins=bins,
         rel_err=rel_err,
         unpivot_strategy=unpivot_strategy,
@@ -446,7 +445,9 @@ def gini_by_numeric_features_with_missing(
      .withColumnRenamed("direction", "direction_missing_zero") \
      .withColumnRenamed("bins_used", "bins_used_missing_zero")
 
-    # 3) Join por variable
+    # ============================================================
+    # 3) Join results
+    # ============================================================
     out = (
         res_no.join(res_zero, on="variable", how="left")
               .select(
@@ -463,14 +464,16 @@ def gini_by_numeric_features_with_missing(
 from pyspark.sql import functions as F
 
 gini_uni = gini_by_numeric_features_with_missing(
-    df=credit_df,
+    df=df_credit,
     label="default_flag",
+    exclude=["id_cliente", "fecha", "cod_producto", "default_flag"],
     bins=64,
     rel_err=1e-3,
-    unpivot_strategy="loop",    # si tienes muchas columnas
-    sample_frac=0.3             # si la base es muy grande
+    unpivot_strategy="loop",
+    sample_frac=0.3     # si la base es pesada
 )
 
-gini_uni.orderBy(F.desc("gini_no_missing")).show(20, truncate=False)
+gini_uni.orderBy(F.desc("gini_no_missing")).show(40, truncate=False)
+
 
 
