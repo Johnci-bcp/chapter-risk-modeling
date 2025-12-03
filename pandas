@@ -1,15 +1,50 @@
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
+import pandas as pd
 
-def describe_numeric_pandas(df: pd.DataFrame, exclude=None):
-    """
-    Univariate numeric profiling for pandas DataFrames.
-    
-    Returns:
-      variable, n_non_missing, missing_pct,
-      mean, std, min, max, p1, median, p99
-    """
+from typing import Dict, Any, Optional, Tuple, List
+from xgboost import XGBClassifier
 
+
+# ============================================================
+# 1) Univariate numeric profiling (pandas)
+# ============================================================
+
+def describe_numeric_pandas(
+    df: pd.DataFrame,
+    exclude: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Compute univariate numeric profiling for a pandas DataFrame.
+
+    For each numeric column (excluding those in `exclude`), this function
+    returns a row with:
+
+      - variable: column name
+      - n_non_missing: number of non-missing observations
+      - missing_pct: percentage of missing values
+      - mean: arithmetic mean
+      - stddev: sample standard deviation (ddof=1, same as pandas .std())
+      - min: minimum value
+      - max: maximum value
+      - p1: 1st percentile (0.01 quantile)
+      - median: 50th percentile (0.50 quantile)
+      - p99: 99th percentile (0.99 quantile)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    exclude : list of str, optional
+        List of column names to exclude from the profiling (IDs, target, etc.).
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format DataFrame with one row per numeric variable and the
+        descriptive statistics listed above.
+    """
     exclude = set(exclude or [])
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     numeric_cols = [c for c in numeric_cols if c not in exclude]
@@ -20,75 +55,119 @@ def describe_numeric_pandas(df: pd.DataFrame, exclude=None):
         series = df[col]
         n = len(series)
         n_non_missing = series.count()
-        missing_pct = (n - n_non_missing) / n * 100
+        missing_pct = (n - n_non_missing) / n * 100.0
 
-        # percentiles
+        # Percentiles (will ignore NaNs by default)
         p1, median, p99 = series.quantile([0.01, 0.5, 0.99])
 
-        rows.append({
-            "variable": col,
-            "n_non_missing": n_non_missing,
-            "missing_pct": missing_pct,
-            "mean": series.mean(),
-            "stddev": series.std(),
-            "min": series.min(),
-            "max": series.max(),
-            "p1": p1,
-            "median": median,
-            "p99": p99
-        })
+        rows.append(
+            {
+                "variable": col,
+                "n_non_missing": n_non_missing,
+                "missing_pct": missing_pct,
+                "mean": series.mean(),
+                "stddev": series.std(),
+                "min": series.min(),
+                "max": series.max(),
+                "p1": p1,
+                "median": median,
+                "p99": p99,
+            }
+        )
 
     return pd.DataFrame(rows)
 
-desc_uni = describe_numeric_pandas(
-    df=pdf, 
-    exclude=["id_cliente", "default_flag"]
-)
 
-desc_uni
+# ============================================================
+# 2) Univariate Gini / AUC (pandas)
+# ============================================================
 
-
-def _auc_from_series(x, y):
+def _auc_from_series(x: pd.Series, y: pd.Series) -> Optional[float]:
     """
-    Compute AUC using rank-based Mann–Whitney formulation.
-    x = predictor values (pd.Series)
-    y = binary target (pd.Series of 0/1)
-    """
+    Compute AUC using the rank-based Mann–Whitney formulation.
 
+    This is equivalent to the Wilcoxon rank-sum statistic-based AUC:
+
+        AUC = (sum of ranks of positive class - n_pos*(n_pos+1)/2) / (n_pos*n_neg)
+
+    Parameters
+    ----------
+    x : pd.Series
+        Predictor values (continuous or discrete).
+    y : pd.Series
+        Binary target, expected values 0/1 (will not be coerced internally).
+
+    Returns
+    -------
+    float or None
+        Estimated AUC. Returns None if all targets are 0 or all are 1.
+    """
     df_tmp = pd.DataFrame({"x": x, "y": y})
     df_tmp = df_tmp.dropna(subset=["x"])
 
+    # Degenerate cases: all negatives or all positives
     if df_tmp["y"].sum() == 0:
         return None
     if df_tmp["y"].sum() == len(df_tmp):
         return None
 
+    # Sort by predictor
     df_tmp = df_tmp.sort_values("x")
-    n_pos = df_tmp["y"].sum()
+    n_pos = int(df_tmp["y"].sum())
     n_neg = len(df_tmp) - n_pos
 
-    # ranks start at 1
+    # Ranks start at 1
     df_tmp["rank"] = np.arange(1, len(df_tmp) + 1)
 
     rank_sum_pos = df_tmp.loc[df_tmp["y"] == 1, "rank"].sum()
 
-    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-    return auc
+    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
 
 
-def univariate_gini_pandas(df: pd.DataFrame, target: str, exclude=None):
+def univariate_gini_pandas(
+    df: pd.DataFrame,
+    target: str,
+    exclude: Optional[List[str]] = None
+) -> pd.DataFrame:
     """
-    Compute univariate Gini for each numeric feature in a pandas DataFrame.
+    Compute univariate AUC and Gini for each numeric feature in a pandas DataFrame.
 
-    For each feature:
-      - gini_no_missing: drop rows where feature is null
-      - gini_missing_zero: replace missing with 0
+    For each numeric feature (excluding those in `exclude` and the `target`),
+    the function computes two Gini coefficients:
 
-    Returns:
-      variable, auc_no_missing, gini_no_missing,
-      auc_missing_zero, gini_missing_zero
+      1) gini_no_missing:
+         - Drop rows where the feature is missing (NaN).
+         - Compute AUC using the rank-based Mann–Whitney approach.
+         - Gini = 2 * AUC - 1.
+
+      2) gini_missing_zero:
+         - Replace missing feature values with 0.
+         - Compute AUC on this imputed version.
+         - Gini = 2 * AUC - 1.
+
+    This is particularly useful in credit scoring / risk modeling to understand
+    how sensitive the univariate discrimination is to missing-value handling.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    target : str
+        Name of the binary target column (0/1).
+    exclude : list of str, optional
+        List of column names to exclude from the analysis (IDs, leakage, etc.).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with one row per numeric variable and columns:
+          - variable
+          - auc_no_missing
+          - gini_no_missing
+          - auc_missing_zero
+          - gini_missing_zero
     """
-
     exclude = set(exclude or [])
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     numeric_cols = [c for c in numeric_cols if c not in exclude and c != target]
@@ -100,45 +179,31 @@ def univariate_gini_pandas(df: pd.DataFrame, target: str, exclude=None):
     for col in numeric_cols:
         x = df[col]
 
-        # 1) Gini sin missing
+        # 1) Gini dropping missing values
         auc_no = _auc_from_series(x, y)
-        gini_no = 2 * auc_no - 1 if auc_no is not None else None
+        gini_no = 2.0 * auc_no - 1.0 if auc_no is not None else None
 
-        # 2) Gini imputando missing a cero
+        # 2) Gini imputing missing values with zero
         x_miss0 = x.fillna(0)
         auc_zero = _auc_from_series(x_miss0, y)
-        gini_zero = 2 * auc_zero - 1 if auc_zero is not None else None
+        gini_zero = 2.0 * auc_zero - 1.0 if auc_zero is not None else None
 
-        rows.append({
-            "variable": col,
-            "auc_no_missing": auc_no,
-            "gini_no_missing": gini_no,
-            "auc_missing_zero": auc_zero,
-            "gini_missing_zero": gini_zero
-        })
+        rows.append(
+            {
+                "variable": col,
+                "auc_no_missing": auc_no,
+                "gini_no_missing": gini_no,
+                "auc_missing_zero": auc_zero,
+                "gini_missing_zero": gini_zero,
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
-
-univariate = (
-    desc_uni
-    .merge(gini_uni, on="variable", how="left")
-    .sort_values("gini_no_missing", ascending=False)
-)
-
-
-
-
-
-______
-
-
-import numpy as np
-import pandas as pd
-from typing import Dict, Any, Optional, Tuple, List
-from xgboost import XGBClassifier
-
+# ============================================================
+# 3) NAFS-style feature reduction (pandas + XGBoost)
+# ============================================================
 
 def nafs_feature_reduction(
     X: pd.DataFrame,
@@ -151,56 +216,60 @@ def nafs_feature_reduction(
     xgb_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
     """
-    NAFS-style feature reduction.
+    NAFS-style feature reduction using XGBoost and shadow/noise features.
 
-    Para cada run:
-      1) Crea "shadow features" permutadas para cada variable real.
-      2) Entrena un XGBoost con features reales + shadow.
-      3) Calcula la importancia por gain.
-      4) Calcula un umbral como el quantil `noise_quantile` de los gains de shadow.
-      5) Marca las features reales cuyo gain supera ese umbral.
+    Concept
+    -------
+    For each run:
+      1) Create "shadow" (noise) features by permuting each real feature.
+         Optionally repeat this `noise_multiplier` times.
+      2) Fit an XGBoost model using real + shadow features.
+      3) Compute gain-based feature importance.
+      4) Compute a noise threshold as the `noise_quantile` of the shadow
+         feature gains.
+      5) For each real feature, mark whether its gain exceeds that threshold.
 
-    Al final:
-      - selection_freq = (# de runs donde la feature venció al ruido) / n_runs
-      - Se seleccionan features con selection_freq >= min_selection_freq.
-      - Si ninguna pasa el filtro, se devuelven todas las features originales.
+    After `n_runs`:
+      - selection_freq[feature] = (# runs where feature beat noise) / n_runs
+      - Keep features with selection_freq >= min_selection_freq.
+      - If no feature passes the threshold, fallback to keeping all features.
 
     Parameters
     ----------
     X : pd.DataFrame
-        Matriz de diseño (solo variables explicativas, ya codificadas).
+        Design matrix with explanatory variables (already encoded, numeric).
     y : pd.Series
-        Target binario (0/1).
+        Binary target (0/1).
     n_runs : int
-        Número de modelos NAFS (corridas).
+        Number of NAFS model runs.
     noise_multiplier : int
-        Número de copias de ruido por feature real.
+        Number of shadow copies per real feature.
     noise_quantile : float
-        Quantil sobre las importancias de ruido para definir el umbral.
+        Quantile over shadow feature gains used as the noise threshold.
     min_selection_freq : float
-        Frecuencia mínima para conservar una feature.
+        Minimum selection frequency to retain a feature.
     random_state : int
-        Semilla base del generador aleatorio.
-    xgb_kwargs : dict, opcional
-        Parámetros adicionales para XGBClassifier (se mezclan con los defaults NAFS).
+        Base random seed for the noise generator and models.
+    xgb_kwargs : dict, optional
+        Additional keyword arguments for XGBClassifier. These override
+        the internal defaults used for NAFS.
 
     Returns
     -------
     X_reduced : pd.DataFrame
-        Matriz X reducida, solo con las features seleccionadas.
+        Reduced feature matrix with only selected features.
     selection_freq : pd.Series
-        Frecuencia de selección por feature (índice = nombre de la columna).
+        Selection frequency per feature (index = feature name).
     selected_features : list[str]
-        Lista de nombres de columnas seleccionadas.
+        List of selected feature names.
     """
-
     rng = np.random.default_rng(random_state)
     real_features = X.columns.tolist()
 
-    # Frecuencia de veces que cada feature "vence al ruido"
+    # Count in how many runs each feature beats the noise threshold
     beat_noise_counts = pd.Series(0, index=real_features, dtype=float)
 
-    # Defaults razonables (puedes ajustar fuera)
+    # Default XGBoost parameters for NAFS (can be overridden via xgb_kwargs)
     base_params: Dict[str, Any] = dict(
         objective="binary:logistic",
         eval_metric="logloss",
@@ -218,35 +287,35 @@ def nafs_feature_reduction(
         X_shadow = X.copy()
         shadow_cols: List[str] = []
 
-        # 1) Generar shadow features
+        # 1) Generate shadow features
         for m in range(noise_multiplier):
             for col in real_features:
                 shadow_col = f"shadow_{m}_{col}"
                 X_shadow[shadow_col] = rng.permutation(X[col].values)
                 shadow_cols.append(shadow_col)
 
-        # 2) Entrenar modelo con ruido
+        # 2) Fit model on real + shadow features
         model = XGBClassifier(
             random_state=random_state + run,
             **base_params,
         )
         model.fit(X_shadow, y)
 
-        # 3) Importancias por gain
+        # 3) Gain-based importances
         gain_dict = model.get_booster().get_score(importance_type="gain")
         gain_series = pd.Series(gain_dict, dtype=float)
 
         real_gain = gain_series.reindex(real_features).fillna(0.0)
         shadow_gain = gain_series.reindex(shadow_cols).fillna(0.0)
 
-        # 4) Umbral de ruido (quantil)
+        # 4) Noise threshold from shadow gains
         if len(shadow_gain) > 0:
             shadow_threshold = shadow_gain.quantile(noise_quantile)
         else:
-            # Por seguridad, si no hay shadow (no debería pasar)
+            # Safety fallback (should not happen in normal use)
             shadow_threshold = 0.0
 
-        # 5) Sumar 1 cuando la feature supera el ruido
+        # 5) Increment count for features that beat the noise threshold
         beat_noise_counts += (real_gain > shadow_threshold).astype(int)
 
     selection_freq = beat_noise_counts / float(n_runs)
@@ -255,7 +324,7 @@ def nafs_feature_reduction(
         selection_freq >= min_selection_freq
     ].index.tolist()
 
-    # Fallback: si NAFS fue demasiado estricto, usamos todas
+    # Fallback: if NAFS is too strict, keep all features
     if len(selected_features) == 0:
         selected_features = real_features
 
@@ -264,12 +333,9 @@ def nafs_feature_reduction(
     return X_reduced, selection_freq, selected_features
 
 
-
-from typing import Dict, Any, Optional, List, Tuple
-import numpy as np
-import pandas as pd
-from xgboost import XGBClassifier
-
+# ============================================================
+# 4) Importance-ordered correlation pruning (pandas + XGBoost)
+# ============================================================
 
 def importance_ordered_correlation_pruning(
     X: pd.DataFrame,
@@ -286,57 +352,61 @@ def importance_ordered_correlation_pruning(
     List[str],
 ]:
     """
-    Fit an XGBoost model, compute feature importances by gain,
-    build correlation structure, and perform importance-ordered
+    Fit an XGBoost model, compute gain-based feature importances,
+    build a correlation structure, and perform importance-ordered
     correlation pruning (greedy filter).
 
     Steps
     -----
-    1) Fit XGBClassifier on X, y with given params.
-    2) Extract gain importances, sort descending.
-    3) Filter to features present in X.
-    4) Compute Pearson correlation matrix on gain-ordered features.
-    5) Flatten upper triangle into a correlation vector.
-    6) Greedy selection:
-       - Recorre las features en orden de gain.
-       - Incluye la primera siempre.
-       - Para cada feature siguiente, la agrega solo si
-         su |corr| con cualquier feature ya seleccionada < corr_threshold.
+    1) Fit XGBClassifier on X, y with provided `xgb_params` plus
+       standard binary classification defaults (objective, eval_metric, etc.).
+    2) Extract feature importances by gain and sort descending.
+    3) Compute Pearson correlation matrix using only features with gain > 0.
+    4) Flatten the upper triangle of the correlation matrix into a correlation
+       vector (feature_i, feature_j, corr, abs_corr).
+    5) Greedy feature selection:
+       - Traverse features in descending order of gain.
+       - Always keep the first (most important).
+       - For each subsequent feature, keep it only if its maximum absolute
+         correlation with the already selected set is below `corr_threshold`.
+
+    This implements an "importance-ordered correlation pruning" that removes
+    redundant features while respecting the initial ranking given by XGBoost.
 
     Parameters
     ----------
     X : pd.DataFrame
-        Matriz de diseño (features).
+        Design matrix (features only).
     y : pd.Series
-        Target binario (0/1).
+        Binary target (0/1).
     xgb_params : dict
-        Parámetros del XGBClassifier (incluyendo n_estimators, max_depth, etc.).
-        NO incluyas "objective", "eval_metric", "n_jobs", "random_state" ni
-        "scale_pos_weight"; estos se setean dentro de la función.
+        Hyperparameters for XGBClassifier (e.g., n_estimators, max_depth, etc.).
+        Do not include "objective", "eval_metric", "n_jobs", "random_state",
+        or "scale_pos_weight"; they are set internally by this function.
     corr_threshold : float
-        Umbral máximo de correlación absoluta permitido entre features seleccionadas.
+        Maximum allowed absolute correlation between any two selected features.
     random_state : int
-        Semilla para XGBClassifier.
-    scale_pos_weight : float, opcional
-        Peso para la clase positiva. Si es None, se calcula como n_neg / n_pos.
+        Random seed for XGBClassifier.
+    scale_pos_weight : float, optional
+        Class weight for the positive class. If None, it is computed as n_neg / n_pos.
 
     Returns
     -------
     model : XGBClassifier
-        Modelo entrenado con todas las columnas de X.
+        XGBClassifier fitted on the full X (before pruning).
     gain_df : pd.DataFrame
-        DataFrame con columnas ["feature", "gain"], ordenado por gain desc.
+        DataFrame with columns ["feature", "gain"], sorted by gain descending.
     corr_matrix : pd.DataFrame
-        Matriz de correlaciones (Pearson) sobre las features con gain.
+        Pearson correlation matrix for the gain-ordered features.
     corr_vector : pd.DataFrame
-        Vector de correlaciones (upper triangle) con columnas:
-        ["feature_i", "feature_j", "corr", "abs_corr"], ordenado por abs_corr desc.
+        Flattened upper triangle of the correlation matrix with columns:
+          ["feature_i", "feature_j", "corr", "abs_corr"],
+        sorted by abs_corr descending.
     selected_features : list[str]
-        Lista de features seleccionadas por el filtro greedy.
+        Features retained by the importance-ordered correlation pruning.
     """
-
     # ---------------------------------------------------------
-    # 0) Preparar scale_pos_weight
+    # 0) Compute scale_pos_weight if needed
     # ---------------------------------------------------------
     y = y.astype(int)
     pos = int(y.sum())
@@ -346,7 +416,7 @@ def importance_ordered_correlation_pruning(
         scale_pos_weight = (neg / pos) if pos > 0 else 1.0
 
     # ---------------------------------------------------------
-    # 1) Entrenar XGBClassifier con todos los features (ya reducidos si aplica)
+    # 1) Fit XGBClassifier with all features
     # ---------------------------------------------------------
     base_params = dict(
         objective="binary:logistic",
@@ -361,7 +431,7 @@ def importance_ordered_correlation_pruning(
     model.fit(X, y)
 
     # ---------------------------------------------------------
-    # 2) Importancias por gain
+    # 2) Gain-based importances
     # ---------------------------------------------------------
     gain_dict = model.get_booster().get_score(importance_type="gain")
     gain_df = (
@@ -371,7 +441,7 @@ def importance_ordered_correlation_pruning(
     )
     gain_features = [f for f in gain_df["feature"].tolist() if f in X.columns]
 
-    # Si no hay ninguna feature con gain, devolvemos vacío
+    # If no feature has gain, return empty structures
     if len(gain_features) == 0:
         corr_matrix = pd.DataFrame()
         corr_vector = pd.DataFrame(columns=["feature_i", "feature_j", "corr", "abs_corr"])
@@ -379,12 +449,12 @@ def importance_ordered_correlation_pruning(
         return model, gain_df, corr_matrix, corr_vector, selected_features
 
     # ---------------------------------------------------------
-    # 3) Matriz de correlaciones
+    # 3) Correlation matrix and vector
     # ---------------------------------------------------------
     X_gain = X[gain_features].copy()
     corr_matrix = X_gain.corr(method="pearson")
 
-    # Upper triangle → vector de pares correlacionados
+    # Upper triangle → vector of correlated pairs
     upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
     corr_vector = (
         corr_matrix.where(upper_mask)
@@ -396,7 +466,7 @@ def importance_ordered_correlation_pruning(
     corr_vector = corr_vector.sort_values("abs_corr", ascending=False).reset_index(drop=True)
 
     # ---------------------------------------------------------
-    # 4) Filtro greedy por importancia (importance-ordered correlation pruning)
+    # 4) Greedy importance-ordered correlation pruning
     # ---------------------------------------------------------
     selected_features: List[str] = []
 
@@ -405,7 +475,7 @@ def importance_ordered_correlation_pruning(
             selected_features.append(f)
             continue
 
-        # Máxima correlación absoluta con lo ya seleccionado
+        # Maximum absolute correlation with already selected features
         max_abs_corr = corr_matrix.loc[f, selected_features].abs().fillna(0.0).max()
         if max_abs_corr < corr_threshold:
             selected_features.append(f)
@@ -413,51 +483,71 @@ def importance_ordered_correlation_pruning(
     return model, gain_df, corr_matrix, corr_vector, selected_features
 
 
-
-# 1) NAFS reduction
-X_nafs, sel_freq, feats_nafs = nafs_feature_reduction(
-    X=pdf.drop(columns=["target"]),
-    y=pdf["target"],
-    n_runs=20,
-    noise_multiplier=1,
-    noise_quantile=0.95,
-    min_selection_freq=0.60,
-    random_state=42,
-)
-
-# 2) Importance-ordered correlation pruning con tus mejores hiperparámetros
-best_xgb_params = dict(
-    n_estimators=400,
-    learning_rate=0.05,
-    max_depth=3,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    min_child_weight=3,
-    gamma=0.0,
-    reg_alpha=0.0,
-    reg_lambda=2.0,
-    grow_policy="depthwise",
-    max_leaves=0,
-)
-
-model_best, gain_df, corr_matrix, corr_vector, selected_feats = (
-    importance_ordered_correlation_pruning(
-        X=X_nafs,
-        y=pdf["target"],
-        xgb_params=best_xgb_params,
-        corr_threshold=0.60,
-        random_state=42,
-    )
-)
-
-# X listo para el modelo final
-X_final = X_nafs[selected_feats].copy()
-
-
-
-
-
-
-
-
-
+# ============================================================
+# 5) Example usage (commented)
+# ============================================================
+#
+# # Assume `pdf` is a pandas DataFrame with a binary target "default_flag"
+# # and an ID column "id_cliente".
+#
+# # 1) Descriptive statistics
+# desc_uni = describe_numeric_pandas(
+#     df=pdf,
+#     exclude=["id_cliente", "default_flag"]
+# )
+#
+# # 2) Univariate Gini
+# gini_uni = univariate_gini_pandas(
+#     df=pdf,
+#     target="default_flag",
+#     exclude=["id_cliente"]
+# )
+#
+# # 3) Combine univariate stats + Gini
+# univariate = (
+#     desc_uni
+#     .merge(gini_uni, on="variable", how="left")
+#     .sort_values("gini_no_missing", ascending=False)
+# )
+#
+# # 4) NAFS-style feature reduction
+# X = pdf.drop(columns=["default_flag"])
+# y = pdf["default_flag"]
+#
+# X_nafs, sel_freq, feats_nafs = nafs_feature_reduction(
+#     X=X,
+#     y=y,
+#     n_runs=20,
+#     noise_multiplier=1,
+#     noise_quantile=0.95,
+#     min_selection_freq=0.60,
+#     random_state=42,
+# )
+#
+# # 5) Importance-ordered correlation pruning on NAFS-reduced features
+# best_xgb_params = dict(
+#     n_estimators=400,
+#     learning_rate=0.05,
+#     max_depth=3,
+#     subsample=0.8,
+#     colsample_bytree=0.8,
+#     min_child_weight=3,
+#     gamma=0.0,
+#     reg_alpha=0.0,
+#     reg_lambda=2.0,
+#     grow_policy="depthwise",
+#     max_leaves=0,
+# )
+#
+# model_best, gain_df, corr_matrix, corr_vector, selected_feats = (
+#     importance_ordered_correlation_pruning(
+#         X=X_nafs,
+#         y=y,
+#         xgb_params=best_xgb_params,
+#         corr_threshold=0.60,
+#         random_state=42,
+#     )
+# )
+#
+# # 6) Final feature set for modeling
+# X_final = X_nafs[selected_feats].copy()
