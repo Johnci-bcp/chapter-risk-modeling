@@ -180,6 +180,11 @@ def describe_numeric_in_chunks(df, exclude=None, rel_error=0.001, chunk_size=50)
     return combined
 
 
+[JVM_ATTRIBUTE_NOT_SUPPORTED] Directly accessing the underlying Spark driver JVM using the attribute '_jdf' is not supported on shared clusters. If you require direct access to these fields, consider using a single-user cluster. For more details on compatibility and limitations, check: https://learn.microsoft.com/azure/databricks/compute/access-mode-limitations.html#shared-access-mode-limitations-on-unity-catalog
+
+
+
+
 from typing import List, Optional
 from pyspark.sql import functions as F, Window
 from pyspark.sql.types import NumericType
