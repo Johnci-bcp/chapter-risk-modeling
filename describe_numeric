@@ -1,30 +1,14 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import NumericType
-from pyspark.sql import functions as F
 from functools import reduce
 
 def describe_numeric_in_chunks(df, exclude=None, rel_error=0.001, chunk_size=50):
     """
     Chunk-based numeric profiling for very wide tables.
 
-    Parameters
-    ----------
-    df : pyspark.sql.DataFrame
-        Input Spark DataFrame.
-    exclude : list of str, optional
-        List of columns to exclude from the numeric summary.
-    rel_error : float, optional
-        Relative error for approxQuantile() in each chunk.
-    chunk_size : int, optional
-        Number of numeric columns to profile per chunk.
-
-    Returns
-    -------
-    pyspark.sql.DataFrame
-        Long-format DataFrame with statistics:
-        [variable, n_non_missing, missing_pct,
-         mean, stddev, min, max, p1, median, p99]
-        for all numeric columns not in `exclude`.
+    Output:
+      variable, n_non_missing, missing_pct (0–100),
+      mean, stddev, min, max, p1, median, p99
     """
 
     exclude = set(exclude or [])
@@ -35,22 +19,19 @@ def describe_numeric_in_chunks(df, exclude=None, rel_error=0.001, chunk_size=50)
 
     spark = df.sparkSession
 
+    schema_str = (
+        "variable string, "
+        "n_non_missing double, missing_pct double, "
+        "mean double, stddev double, min double, max double, "
+        "p1 double, median double, p99 double"
+    )
+
     if not numeric_cols:
-        return spark.createDataFrame([],
-            "variable string, "
-            "n_non_missing double, missing_pct double, "
-            "mean double, stddev double, min double, max double, "
-            "p1 double, median double, p99 double"
-        )
+        return spark.createDataFrame([], schema_str)
 
     total_rows = df.count()
     if total_rows == 0:
-        return spark.createDataFrame([],
-            "variable string, "
-            "n_non_missing double, missing_pct double, "
-            "mean double, stddev double, min double, max double, "
-            "p1 double, median double, p99 double"
-        )
+        return spark.createDataFrame([], schema_str)
 
     # Split numeric columns into chunks
     chunks = [
@@ -61,24 +42,17 @@ def describe_numeric_in_chunks(df, exclude=None, rel_error=0.001, chunk_size=50)
     results = []
 
     for cols in chunks:
-        # Work on a narrower DataFrame with only the current chunk of columns
         sub_df = df.select(*cols)
-        # Profile this chunk using the optimized function, reusing total_rows
         res_chunk = describe_numeric_faster(
             sub_df,
             exclude=None,
             rel_error=rel_error,
-            total_rows=total_rows
+            total_rows=total_rows  # reuse same total_rows
         )
         results.append(res_chunk)
 
     if not results:
-        return spark.createDataFrame([],
-            "variable string, "
-            "n_non_missing double, missing_pct double, "
-            "mean double, stddev double, min double, max double, "
-            "p1 double, median double, p99 double"
-        )
+        return spark.createDataFrame([], schema_str)
 
     combined = reduce(DataFrame.unionByName, results)
 
