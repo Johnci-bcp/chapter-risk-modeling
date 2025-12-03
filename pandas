@@ -1,0 +1,49 @@
+
+
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+# opcional: tamaño máximo de batch
+spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "500000")
+
+import pandas as pd
+
+def spark_to_pandas_in_chunks(
+    sdf,
+    n_partitions: int = None,
+):
+    """
+    Generator que devuelve trozos (chunks) de la tabla Spark como DataFrames de pandas.
+    
+    Parámetros
+    ----------
+    sdf : pyspark.sql.DataFrame
+        DataFrame de Spark, típicamente spark.table("...").
+    n_partitions : int o None
+        Si se indica, se hace sdf.repartition(n_partitions) antes de iterar.
+        Cada partición será un chunk aproximado.
+    
+    Yield
+    -----
+    pd.DataFrame
+        Chunk de datos en pandas.
+    """
+    if n_partitions is not None:
+        sdf = sdf.repartition(n_partitions)
+
+    # Arrow ya está habilitado vía spark.conf
+    for batch in sdf.toLocalIterator():
+        yield batch.toPandas()
+
+
+credit_df = spark.table("mi_catalogo.mi_esquema.mi_tabla")
+
+# Por ejemplo, 20 chunks aproximados
+for i, pdf_chunk in enumerate(spark_to_pandas_in_chunks(credit_df, n_partitions=20)):
+    print(f"Chunk {i}, shape = {pdf_chunk.shape}")
+    # aquí haces tu análisis univariado, gini, etc. sobre cada chunk o acumulas
+
+import pandas as pd
+
+chunks = list(spark_to_pandas_in_chunks(credit_df, n_partitions=20))
+pdf_full = pd.concat(chunks, ignore_index=True)
+
+
