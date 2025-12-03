@@ -1,291 +1,77 @@
-def describe_numeric_fast(df, exclude=None, accuracy=10000):
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType
+
+def describe_numeric_faster(df, exclude=None, rel_error=0.001):
     """
-    Compute summary statistics for all numeric columns in a single Spark job.
-    Returns a Spark DataFrame with columns:
-        [variable, mean, stddev, min, max, p1, median, p99]
+    Faster numeric profiling using:
+      - DataFrame.summary() for mean, stddev, min, max
+      - approxQuantile() for p1, median, p99
 
     Parameters
     ----------
     df : pyspark.sql.DataFrame
         Input Spark DataFrame.
-
     exclude : list of str, optional
-        List of columns to exclude from the numeric summary.
-        Default is None.
-
-    accuracy : int, optional
-        Accuracy parameter for percentile_approx().
-        Higher values yield more precise percentiles but require more memory.
-        Default = 10_000 (good balance between accuracy and performance).
+        Columns to exclude.
+    rel_error : float, optional
+        Relative error for approxQuantile().
+        Lower values increase accuracy but require more computation.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        A long-format DataFrame where each row corresponds to one numeric column,
-        containing its main descriptive statistics.
-
-    Notes
-    -----
-    • This implementation runs in a single aggregation job — no loops or collects.
-    • Percentiles (p1, median, p99) are computed with percentile_approx()
-      for efficiency; they are approximate but very close on large datasets.
-    • Suitable for quick profiling, data quality checks, or model monitoring dashboards.
+        Long-format DataFrame with statistics:
+        [variable, mean, stddev, min, max, p1, median, p99]
     """
-    from pyspark.sql import functions as F
-    from pyspark.sql.types import NumericType
 
-    # Identify numeric columns
     exclude = set(exclude or [])
-    numeric_cols = [f.name for f in df.schema.fields
-                    if isinstance(f.dataType, NumericType) and f.name not in exclude]
+    numeric_cols = [
+        f.name for f in df.schema.fields
+        if isinstance(f.dataType, NumericType) and f.name not in exclude
+    ]
 
-    # Return empty DataFrame if no numeric columns
     if not numeric_cols:
-        return df.sparkSession.createDataFrame([], 
-            "variable string, mean double, stddev double, min double, max double, p1 double, median double, p99 double")
+        return df.sparkSession.createDataFrame([],
+            "variable string, mean double, stddev double, min double, max double, p1 double, median double, p99 double"
+        )
 
-    # --- 1) Compute all statistics in one aggregation job ---
-    exprs = []
-    for c in numeric_cols:
-        exprs.extend([
-            F.mean(c).alias(f"{c}__mean"),
-            F.stddev_samp(c).alias(f"{c}__stddev"),
-            F.min(c).alias(f"{c}__min"),
-            F.max(c).alias(f"{c}__max"),
-            F.expr(f"percentile_approx(`{c}`, 0.01, {accuracy})").alias(f"{c}__p1"),
-            F.expr(f"percentile_approx(`{c}`, 0.50, {accuracy})").alias(f"{c}__p50"),
-            F.expr(f"percentile_approx(`{c}`, 0.99, {accuracy})").alias(f"{c}__p99"),
-        ])
-    agg1 = df.agg(*exprs)
-
-    # --- 2) Transform wide → long format efficiently ---
-    lit_vars = F.array(*[F.lit(c) for c in numeric_cols])
-    arr_mean = F.array(*[F.col(f"{c}__mean")  for c in numeric_cols])
-    arr_std  = F.array(*[F.col(f"{c}__stddev") for c in numeric_cols])
-    arr_min  = F.array(*[F.col(f"{c}__min")   for c in numeric_cols])
-    arr_max  = F.array(*[F.col(f"{c}__max")   for c in numeric_cols])
-    arr_p1   = F.array(*[F.col(f"{c}__p1")    for c in numeric_cols])
-    arr_p50  = F.array(*[F.col(f"{c}__p50")   for c in numeric_cols])
-    arr_p99  = F.array(*[F.col(f"{c}__p99")   for c in numeric_cols])
-
-    zipped = F.arrays_zip(
-        lit_vars.alias("variable"),
-        arr_mean.alias("mean"),
-        arr_std.alias("stddev"),
-        arr_min.alias("min"),
-        arr_max.alias("max"),
-        arr_p1.alias("p1"),
-        arr_p50.alias("median"),
-        arr_p99.alias("p99")
+    # Step 1: Basic statistics via summary()
+    basic = (
+        df.select(*numeric_cols)
+          .summary("mean", "stddev", "min", "max")
     )
 
-    long_df = (
-        agg1
-        .select(F.explode(zipped).alias("z"))
-        .select(
-            F.col("z.variable").alias("variable"),
-            F.col("z.mean").alias("mean"),
-            F.col("z.stddev").alias("stddev"),
-            F.col("z.min").alias("min"),
-            F.col("z.max").alias("max"),
-            F.col("z.p1").alias("p1"),
-            F.col("z.median").alias("median"),
-            F.col("z.p99").alias("p99"),
-        )
+    # Convert wide summary to long format
+    basic_long = (
+        basic
+        .selectExpr("summary as stat", "stack({n}, {exprs}) as (variable, value)".format(
+            n=len(numeric_cols),
+            exprs=", ".join([f"'{c}', `{c}`" for c in numeric_cols])
+        ))
+        .groupBy("variable")
+        .pivot("stat", ["mean", "stddev", "min", "max"])
+        .agg(F.first("value"))
     )
 
-    # Sort by median (optional, for readability)
-    return long_df.orderBy(F.desc_nulls_last("median"))
+    # Cast to numeric
+    for col in ["mean", "stddev", "min", "max"]:
+        basic_long = basic_long.withColumn(col, F.col(col).cast("double"))
 
+    # Step 2: Percentiles via approxQuantile()
+    quantiles = df.approxQuantile(numeric_cols, [0.01, 0.5, 0.99], rel_error)
 
+    rows = []
+    for col_name, qvals in zip(numeric_cols, quantiles):
+        p1, p50, p99 = qvals
+        rows.append((col_name, float(p1), float(p50), float(p99)))
 
+    spark = df.sparkSession
+    q_df = spark.createDataFrame(rows, ["variable", "p1", "median", "p99"])
 
-from typing import List, Optional
-from pyspark.sql import functions as F, Window
-from pyspark.sql.types import NumericType
+    # Step 3: Combine both outputs
+    result = (
+        basic_long
+        .join(q_df, on="variable", how="inner")
+    )
 
-def gini_by_numeric_features_fast(
-    df,
-    label: str,
-    positive=1,
-    exclude: Optional[List[str]] = None,
-    bins: int = 128,
-    rel_err: float = 1e-3,
-    unpivot_strategy: str = "stack"
-):
-    """
-    Compute per-feature AUC and Gini (2*AUC-1) for many numeric columns at scale,
-    using quantile-based pre-binning (approxQuantile) + Mann–Whitney formulation,
-    without MLlib Bucketizer (avoids Py4J whitelisting issues). No UDFs.
-
-    Parameters
-    ----------
-    df : pyspark.sql.DataFrame
-        Input DataFrame.
-    label : str
-        Binary target column name.
-    positive : Any
-        Value to be treated as positive class (default=1).
-    exclude : list[str], optional
-        Columns to skip (IDs, leakage vars, etc.).
-    bins : int
-        Number of quantile bins per feature (typ. 64–256).
-    rel_err : float
-        Relative error for approxQuantile (smaller -> more precise, higher cost).
-    unpivot_strategy : {"stack", "loop"}
-        "stack": single wide→long unpivot + one big aggregation (fast if K not huge).
-        "loop" : per-feature light job (safer when you have a very wide table).
-
-    Returns
-    -------
-    pyspark.sql.DataFrame
-        Columns: [variable, auc, gini, direction, n, n_pos, n_neg, bins_used]
-    """
-
-    # ---------------- Helpers ----------------
-    def _build_bin_expr(col, splits):
-        """
-        Build native CASE WHEN expression returning bin index for `col` given sorted `splits`.
-        Bins cover [splits[i], splits[i+1]) except the last, which includes the right bound.
-        """
-        # Ensure -inf / +inf guard rails
-        if splits[0] != float("-inf"):
-            splits = [float("-inf")] + splits
-        if splits[-1] != float("inf"):
-            splits = splits + [float("inf")]
-
-        expr = None
-        last_idx = len(splits) - 2  # num_bins = len(splits)-1
-        for i in range(len(splits) - 1):
-            left = F.lit(splits[i])
-            right = F.lit(splits[i + 1])
-            cond = (col >= left) & (col < right) if i < last_idx else (col >= left) & (col <= right)
-            expr = F.when(cond, F.lit(i)).otherwise(expr) if expr is not None else F.when(cond, F.lit(i))
-        return expr  # null if no match (e.g., null col)
-
-    def _auc_from_binned(agg_df, n, n_pos, n_neg):
-        """
-        Given (variable, bin, cnt, pos, bins_used), compute AUC/Gini with Mann–Whitney.
-        """
-        w = Window.partitionBy("variable").orderBy("bin")
-        cum_cnt = F.sum("cnt").over(w)
-        cum_before = cum_cnt - F.col("cnt")
-        avg_rank = (cum_before + F.lit(1.0) + cum_before + F.col("cnt")) / 2.0
-        sum_ranks_pos = F.sum(avg_rank * F.col("pos")).over(Window.partitionBy("variable"))
-
-        auc_asc = (sum_ranks_pos - F.lit(n_pos * (n_pos + 1) / 2.0)) / F.lit(n_pos * n_neg)
-
-        one = (agg_df
-               .withColumn("auc_asc", auc_asc)
-               .groupBy("variable")
-               .agg(F.max("auc_asc").alias("auc_asc"),
-                    F.max("bins_used").alias("bins_used")))
-
-        one = one.withColumn("auc", F.when(F.col("auc_asc") >= 0.5, F.col("auc_asc")).otherwise(1.0 - F.col("auc_asc")))
-        one = one.withColumn("gini", 2.0 * F.col("auc") - 1.0)
-        one = one.withColumn("direction",
-                             F.when(F.col("auc_asc") >= 0.5, F.lit("ascending"))
-                              .otherwise(F.lit("descending")))
-        one = (one
-               .withColumn("n", F.lit(n))
-               .withColumn("n_pos", F.lit(n_pos))
-               .withColumn("n_neg", F.lit(n_neg)))
-        return one.select("variable", "auc", "gini", "direction", "n", "n_pos", "n_neg", "bins_used")
-
-    # ---------------- 0) Prep & guards ----------------
-    exclude = set(exclude or [])
-    numeric_cols = [f.name for f in df.schema.fields
-                    if isinstance(f.dataType, NumericType) and f.name not in exclude and f.name != label]
-    if not numeric_cols:
-        return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
-        )
-
-    y = (F.col(label) == F.lit(positive)).cast("int").alias("_y_")
-    base = df.select(*numeric_cols, y)
-
-    n_row = base.agg(F.count("*").alias("n"), F.sum("_y_").alias("n_pos")).first()
-    n = int(n_row["n"] or 0)
-    n_pos = int(n_row["n_pos"] or 0)
-    n_neg = n - n_pos
-    if n == 0 or n_pos == 0 or n_neg == 0:
-        return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
-        )
-
-    # ---------------- 1) Quantile splits (one call) ----------------
-    qs = [i / float(bins) for i in range(bins + 1)]
-    edges_all = base.approxQuantile(numeric_cols, qs, rel_err)  # one job
-
-    col_splits = {}
-    for c, edges in zip(numeric_cols, edges_all):
-        uniq = sorted(set(edges))
-        if len(uniq) >= 2:
-            col_splits[c] = uniq
-
-    usable_cols = list(col_splits.keys())
-    if not usable_cols:
-        return df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
-        )
-
-    # ---------------- 2) Bin assignment with CASE WHEN (no Bucketizer) ----------------
-    binned = base
-    for c in usable_cols:
-        binned = binned.withColumn(f"{c}__bin", _build_bin_expr(F.col(c), col_splits[c]))
-
-    # ---------------- 3A) Unpivot strategy: stack ----------------
-    if unpivot_strategy == "stack":
-        parts = []
-        for c in usable_cols:
-            parts += [f"'{c}'", f"`{c}__bin`"]
-        stack_expr = f"stack({len(usable_cols)}, " + ", ".join(parts) + ") as (variable, bin)"
-
-        long_df = binned.selectExpr("_y_", stack_expr).where(F.col("bin").isNotNull())
-
-        agg = (long_df
-               .groupBy("variable", "bin")
-               .agg(F.count("*").alias("cnt"),
-                    F.sum("_y_").alias("pos")))
-        bins_used = agg.groupBy("variable").agg(F.count("*").alias("bins_used"))
-        agg = agg.join(bins_used, "variable", "left")
-
-        return _auc_from_binned(agg, n, n_pos, n_neg)
-
-    # ---------------- 3B) Unpivot strategy: loop ----------------
-    elif unpivot_strategy == "loop":
-        out = None
-        for c in usable_cols:
-            bc = f"{c}__bin"
-            agg = (binned
-                   .select("_y_", F.col(bc).alias("bin"))
-                   .where(F.col("bin").isNotNull())
-                   .groupBy("bin")
-                   .agg(F.count("*").alias("cnt"),
-                        F.sum("_y_").alias("pos"))
-                   .withColumn("variable", F.lit(c)))
-            agg = agg.withColumn("bins_used", F.count("*").over(Window.partitionBy("variable")))
-            res = _auc_from_binned(agg, n, n_pos, n_neg)
-            out = res if out is None else out.unionByName(res, allowMissingColumns=True)
-
-        return out.orderBy(F.desc("gini")) if out is not None else df.sparkSession.createDataFrame(
-            [], "variable string, auc double, gini double, direction string, n long, n_pos long, n_neg long, bins_used int"
-        )
-
-    else:
-        raise ValueError("unpivot_strategy must be 'stack' or 'loop'")
-
-
-
-# Caso típico (rápido con unpivot global):
-out = gini_by_numeric_features_fast(
-    df,
-    label="default_flag",
-    positive=1,
-    exclude=["id", "customer_id"],
-    bins=128,
-    rel_err=1e-3,
-    unpivot_strategy="stack"   # usa "loop" si tienes MUCHÍSIMAS columnas
-)
-out.show(truncate=False)
-
+    return result
