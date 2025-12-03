@@ -1,18 +1,9 @@
 from pyspark.sql import functions as F
 from pyspark.sql.types import NumericType
+from pyspark.sql import DataFrame
+from functools import reduce
 
 def describe_numeric_faster_safe(df, exclude=None, rel_error=0.001):
-    """
-    Numeric profiling using only public PySpark APIs:
-      - df.summary() for count, mean, stddev, min, max
-      - df.approxQuantile() for p1, median, p99
-      - missing_pct computed from count / total_rows
-
-    Output:
-      variable, n_non_missing, missing_pct,
-      mean, stddev, min, max, p1, median, p99
-    """
-
     exclude = set(exclude or [])
     numeric_cols = [
         f.name for f in df.schema.fields
@@ -35,7 +26,6 @@ def describe_numeric_faster_safe(df, exclude=None, rel_error=0.001):
     if total_rows == 0:
         return spark.createDataFrame([], schema_str)
 
-    # 1) summary para count, mean, stddev, min, max
     basic = (
         df.select(*numeric_cols)
           .summary("count", "mean", "stddev", "min", "max")
@@ -68,7 +58,6 @@ def describe_numeric_faster_safe(df, exclude=None, rel_error=0.001):
         .drop("count")
     )
 
-    # 2) approxQuantile para p1, median, p99
     quantiles = df.approxQuantile(numeric_cols, [0.01, 0.5, 0.99], rel_error)
 
     rows = []
@@ -97,15 +86,8 @@ def describe_numeric_faster_safe(df, exclude=None, rel_error=0.001):
 
     return result
 
-from pyspark.sql import DataFrame
-from pyspark.sql.types import NumericType
-from functools import reduce
 
 def describe_numeric_in_chunks_safe(df, exclude=None, rel_error=0.001, chunk_size=50):
-    """
-    Chunk-based numeric profiling for very wide tables, using describe_numeric_faster_safe.
-    """
-
     exclude = set(exclude or [])
     numeric_cols = [
         f.name for f in df.schema.fields
@@ -124,7 +106,6 @@ def describe_numeric_in_chunks_safe(df, exclude=None, rel_error=0.001, chunk_siz
     if not numeric_cols:
         return spark.createDataFrame([], schema_str)
 
-    # Particionamos solo por columnas, no tocamos nada raro de JVM
     chunks = [
         numeric_cols[i:i + chunk_size]
         for i in range(0, len(numeric_cols), chunk_size)
